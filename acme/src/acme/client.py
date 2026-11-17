@@ -8,6 +8,7 @@ import math
 import random
 import time
 from typing import Any
+from typing import Callable
 from typing import cast
 from typing import Mapping
 from typing import Optional
@@ -46,6 +47,19 @@ class ClientV2:
         """
         self.directory = directory
         self.net = net
+        self._poll_sleep: Optional[Callable[[float], None]] = None
+
+    def _sleep(self, seconds: float) -> None:
+        """Wait between polls, allowing embedders to provide cancellation-aware sleep."""
+        sleeper = getattr(self, "_poll_sleep", None)
+        if sleeper is None:
+            time.sleep(seconds)
+        else:
+            sleeper(seconds)
+
+    def set_poll_sleep(self, sleeper: Callable[[float], None]) -> None:
+        """Set a custom sleep function used between ACME polling requests."""
+        self._poll_sleep = sleeper
 
     def new_account(self, new_account: messages.NewRegistration) -> messages.RegistrationResource:
         """Register.
@@ -192,7 +206,7 @@ class ClientV2:
                 if authzr.body.status != messages.STATUS_PENDING:  # pylint: disable=no-member
                     responses.append(authzr)
                     break
-                time.sleep(1)
+                self._sleep(1)
         # If we didn't get a response for every authorization, we fell through
         # the bottom of the loop due to hitting the deadline.
         if len(responses) < len(orderr.body.authorizations):
@@ -246,7 +260,7 @@ class ClientV2:
         sleep_seconds: float = 1
         while datetime.datetime.now() < deadline:
             if sleep_seconds > 0:
-                time.sleep(sleep_seconds)
+                self._sleep(sleep_seconds)
             response = self._post_as_get(orderr.uri)
             body = messages.Order.from_json(response.json())
             if body.status == messages.STATUS_INVALID:

@@ -180,27 +180,33 @@ def run_script(params: list[str], log: Callable[[str], None]=logger.error) -> tu
     :param callable log: Logger method to use for errors
 
     """
+    from certbot._internal import observability
+    cancel_token = observability.active_cancel_token()
     try:
-        proc = subprocess.run(params,
-                              check=False,
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE,
-                              universal_newlines=True,
-                              env=env_no_snap_for_external_calls())
-
+        if cancel_token is None:
+            proc = subprocess.run(params,
+                                  check=False,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE,
+                                  universal_newlines=True,
+                                  env=env_no_snap_for_external_calls())
+            returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+        else:
+            returncode, stderr, stdout = observability.run_process(
+                params, shell=False, env=env_no_snap_for_external_calls())
     except (OSError, ValueError):
         msg = "Unable to run the command: %s" % " ".join(params)
         log(msg)
         raise errors.SubprocessError(msg)
 
-    if proc.returncode != 0:
+    if returncode != 0:
         msg = "Error while running %s.\n%s\n%s" % (
-            " ".join(params), proc.stdout, proc.stderr)
+            " ".join(params), stdout, stderr)
         # Enter recovery routine...
         log(msg)
         raise errors.SubprocessError(msg)
 
-    return proc.stdout, proc.stderr
+    return stdout, stderr
 
 
 def exe_exists(exe: str) -> bool:

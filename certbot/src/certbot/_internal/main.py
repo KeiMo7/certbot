@@ -36,6 +36,7 @@ from certbot._internal import constants
 from certbot._internal import eff
 from certbot._internal import hooks
 from certbot._internal import log
+from certbot._internal import observability
 from certbot._internal import renewal
 from certbot._internal import san
 from certbot._internal import snap_config
@@ -145,7 +146,11 @@ def _get_and_save_cert(le_client: client.Client, config: configuration.Namespace
                 hooks.deploy_hook(config, lineage.sans(), lineage.live_dir)
                 renewed_sans.extend(sans)
     finally:
-        hooks.post_hook(config, renewed_sans)
+        if observability.cancellation_requested(config):
+            with observability.suspend_cancellation():
+                hooks.post_hook(config, renewed_sans)
+        else:
+            hooks.post_hook(config, renewed_sans)
 
     return lineage
 

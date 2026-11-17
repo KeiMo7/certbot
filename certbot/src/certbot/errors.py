@@ -36,6 +36,18 @@ class HookCommandNotFound(Error):
 class SignalExit(Error):
     """A Unix signal was received while in the ErrorHandler context manager."""
 
+
+class TaskCancelled(Error):
+    """A long-running Certbot task was cancelled by its caller."""
+
+    def __init__(self, reason: str = "Certbot operation cancelled.") -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+OperationCancelled = TaskCancelled
+
+
 class OverlappingMatchFound(Error):
     """Multiple lineages matched what should have been a unique result."""
 

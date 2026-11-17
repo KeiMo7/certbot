@@ -8,6 +8,7 @@ Welcome to the Certbot documentation!
    what
    install
    using
+   observability
    contributing
    packaging
    compatibility

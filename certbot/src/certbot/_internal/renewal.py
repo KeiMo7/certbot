@@ -30,6 +30,7 @@ from certbot._internal import cli
 from certbot._internal import client
 from certbot._internal import constants
 from certbot._internal import hooks
+from certbot._internal import observability
 from certbot._internal import san
 from certbot._internal import storage
 from certbot._internal import updater
@@ -631,6 +632,27 @@ def _renew_describe_results(config: configuration.NamespaceConfig, renew_success
 
 def handle_renewal_request(config: configuration.NamespaceConfig) -> None:
     """Examine each lineage; renew if due and report results"""
+    runtime = observability.observability_from_config(config)
+    if not runtime.enabled:
+        return _handle_renewal_request(config, None)
+
+    if config.certname:
+        conf_files = [storage.renewal_file_for_certname(config, config.certname)]
+    else:
+        conf_files = storage.renewal_conf_files(config)
+
+    with runtime.attempt(
+            "renew",
+            total=len(conf_files) * 3,
+            unit="steps",
+            context={"certificate_count": len(conf_files)}) as task:
+        return _handle_renewal_request(config, task, conf_files)
+
+
+def _handle_renewal_request(config: configuration.NamespaceConfig,
+                            task: Optional[observability.TaskObservation],
+                            conf_files: Optional[list[str]] = None) -> None:
+    """Examine each lineage, optionally recording progress."""
 
     sans: list[san.SAN] = config.domains + config.ip_addresses
 
@@ -647,10 +669,11 @@ def handle_renewal_request(config: configuration.NamespaceConfig) -> None:
                            "the certonly command instead. The renew verb may provide other options "
                            "for selecting certificates to renew in the future.")
 
-    if config.certname:
-        conf_files = [storage.renewal_file_for_certname(config, config.certname)]
-    else:
-        conf_files = storage.renewal_conf_files(config)
+    if conf_files is None:
+        if config.certname:
+            conf_files = [storage.renewal_file_for_certname(config, config.certname)]
+        else:
+            conf_files = storage.renewal_conf_files(config)
 
     renew_successes = []
     renew_failures = []
@@ -659,6 +682,8 @@ def handle_renewal_request(config: configuration.NamespaceConfig) -> None:
 
     renewed_domains = []
     failed_domains = []
+    post_hooks_ran = False
+    cancelled = False
 
     # Noninteractive renewals include a random delay in order to spread
     # out the load on the certificate authority servers, even if many
@@ -672,74 +697,141 @@ def handle_renewal_request(config: configuration.NamespaceConfig) -> None:
     # share the connection pool and reuse a single fetched directory.
     ari_clients = AriClientPool(config)
 
-    for renewal_file in conf_files:
-        display_util.notification("Processing " + renewal_file, pause=False)
-        lineage_config = copy.deepcopy(config)
-        assert renewal_file.endswith(".conf") # make sure lineagename_for_filename will not error
-        lineagename = storage.lineagename_for_filename(renewal_file)
+    try:
+        for index, renewal_file in enumerate(conf_files):
+            if task is not None:
+                task.check_cancelled()
+            display_util.notification("Processing " + renewal_file, pause=False)
+            lineage_config = copy.deepcopy(config)
+            # make sure lineagename_for_filename will not error
+            assert renewal_file.endswith(".conf")
+            lineagename = storage.lineagename_for_filename(renewal_file)
+            if task is not None:
+                task.progress(
+                    index * 3,
+                    stage="processing-lineage",
+                    context={"lineage": lineagename, "renewal_file": renewal_file},
+                )
 
-        # Note that this modifies config (to add back the configuration
-        # elements from within the renewal configuration file).
-        try:
-            renewal_candidate = reconstitute(lineage_config, renewal_file)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.error("Renewal configuration file %s (cert: %s) "
-                           "produced an unexpected error: %s. Skipping.",
-                           renewal_file, lineagename, e)
-            logger.debug("Traceback was:\n%s", traceback.format_exc())
-            parse_failures.append(renewal_file)
-            continue
-
-        try:
-            if not renewal_candidate:
+            # Note that this modifies config (to add back the configuration
+            # elements from within the renewal configuration file).
+            try:
+                renewal_candidate = reconstitute(lineage_config, renewal_file)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error("Renewal configuration file %s (cert: %s) "
+                               "produced an unexpected error: %s. Skipping.",
+                               renewal_file, lineagename, e)
+                logger.debug("Traceback was:\n%s", traceback.format_exc())
+                if task is not None:
+                    task.error(
+                        e,
+                        category=observability.ErrorCategory.CONFIGURATION,
+                        context={"lineage": lineagename, "renewal_file": renewal_file},
+                    )
                 parse_failures.append(renewal_file)
-            else:
-                renewal_candidate.ensure_deployed()
-                from certbot._internal import main
-                plugins = plugins_disco.PluginsRegistry.find_all()
-                if should_renew(lineage_config, renewal_candidate, ari_clients):
-                    # Apply random sleep upon first renewal if needed
-                    if apply_random_sleep:
-                        sleep_time = random.uniform(1, 60 * 8)
-                        logger.info("Non-interactive renewal: random delay of %s seconds",
-                                    sleep_time)
-                        time.sleep(sleep_time)
-                        # We will sleep only once this day, folks.
-                        apply_random_sleep = False
+                if task is not None:
+                    task.progress(
+                        (index + 1) * 3,
+                        stage="lineage-skipped",
+                        context={"lineage": lineagename},
+                    )
+                continue
+            if task is not None:
+                task.progress(
+                    index * 3 + 1,
+                    stage="lineage-loaded",
+                    context={"lineage": lineagename, "renewal_file": renewal_file},
+                )
 
-                    # domains have been restored into lineage_config by reconstitute
-                    # but they're unnecessary anyway because renew_cert here
-                    # will just grab them from the certificate
-                    # we already know it's time to renew based on should_renew
-                    # and we have a lineage in renewal_candidate
-                    main.renew_cert(lineage_config, plugins, renewal_candidate)
-                    renew_successes.append(renewal_candidate.fullchain)
-                    renewed_domains.extend(renewal_candidate.sans())
+            try:
+                if not renewal_candidate:
+                    parse_failures.append(renewal_file)
+                    if task is not None:
+                        task.error(
+                            errors.ConfigurationError(
+                                "Renewal configuration could not be parsed."),
+                            category=observability.ErrorCategory.CONFIGURATION,
+                            context={"lineage": lineagename, "renewal_file": renewal_file},
+                        )
                 else:
-                    expiry = crypto_util.notAfter(renewal_candidate.version(
-                        "cert", renewal_candidate.latest_common_version()))
-                    renew_skipped.append("%s expires on %s" % (renewal_candidate.fullchain,
-                                         expiry.strftime("%Y-%m-%d")))
-                # Run updater interface methods
-                updater.run_generic_updaters(lineage_config, renewal_candidate,
-                                             plugins)
+                    renewal_candidate.ensure_deployed()
+                    from certbot._internal import main
+                    plugins = plugins_disco.PluginsRegistry.find_all()
+                    if should_renew(lineage_config, renewal_candidate, ari_clients):
+                        # Apply random sleep upon first renewal if needed
+                        if apply_random_sleep:
+                            sleep_time = random.uniform(1, 60 * 8)
+                            logger.info("Non-interactive renewal: random delay of %s seconds",
+                                        sleep_time)
+                            if task is None:
+                                time.sleep(sleep_time)
+                            else:
+                                observability.wait_or_cancel(sleep_time, config)
+                            # We will sleep only once this day, folks.
+                            apply_random_sleep = False
 
-        except Exception as e:  # pylint: disable=broad-except
-            # obtain_certificate (presumably) encountered an unanticipated problem.
-            logger.error(
-                "Failed to renew certificate %s with error: %s",
-                lineagename, e
-            )
-            logger.debug("Traceback was:\n%s", traceback.format_exc())
-            if renewal_candidate:
-                renew_failures.append(renewal_candidate.fullchain)
-                failed_domains.extend(renewal_candidate.sans())
+                        # domains have been restored into lineage_config by reconstitute
+                        # but they're unnecessary anyway because renew_cert here
+                        # will just grab them from the certificate
+                        # we already know it's time to renew based on should_renew
+                        # and we have a lineage in renewal_candidate
+                        main.renew_cert(lineage_config, plugins, renewal_candidate)
+                        renew_successes.append(renewal_candidate.fullchain)
+                        renewed_domains.extend(renewal_candidate.sans())
+                    else:
+                        expiry = crypto_util.notAfter(renewal_candidate.version(
+                            "cert", renewal_candidate.latest_common_version()))
+                        renew_skipped.append("%s expires on %s" % (renewal_candidate.fullchain,
+                                             expiry.strftime("%Y-%m-%d")))
+                    if task is not None:
+                        task.progress(
+                            index * 3 + 2,
+                            stage="renewal-attempted",
+                            context={"lineage": lineagename},
+                        )
+                    # Run updater interface methods
+                    updater.run_generic_updaters(lineage_config, renewal_candidate,
+                                                 plugins)
+
+            except errors.TaskCancelled:
+                raise
+            except Exception as e:  # pylint: disable=broad-except
+                # obtain_certificate (presumably) encountered an unanticipated problem.
+                logger.error(
+                    "Failed to renew certificate %s with error: %s",
+                    lineagename, e
+                )
+                logger.debug("Traceback was:\n%s", traceback.format_exc())
+                if renewal_candidate:
+                    renew_failures.append(renewal_candidate.fullchain)
+                    failed_domains.extend(renewal_candidate.sans())
+                if task is not None:
+                    task.error(
+                        e,
+                        context={"lineage": lineagename, "renewal_file": renewal_file},
+                    )
+            finally:
+                if task is not None:
+                    task.progress(
+                        (index + 1) * 3,
+                        stage="lineage-complete",
+                        context={"lineage": lineagename},
+                    )
+    except errors.TaskCancelled:
+        cancelled = True
+        raise
+    finally:
+        if cancelled:
+            with observability.suspend_cancellation():
+                hooks.run_saved_post_hooks(renewed_domains, failed_domains)
+                post_hooks_ran = True
 
     # Describe all the results
     _renew_describe_results(config, renew_successes, renew_failures,
                             renew_skipped, parse_failures)
 
-    hooks.run_saved_post_hooks(renewed_domains, failed_domains)
+    if not post_hooks_ran:
+        hooks.run_saved_post_hooks(renewed_domains, failed_domains)
 
     if renew_failures or parse_failures:
         raise errors.Error(

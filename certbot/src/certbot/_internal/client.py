@@ -33,6 +33,7 @@ from certbot._internal import auth_handler
 from certbot._internal import cli
 from certbot._internal import constants
 from certbot._internal import eff
+from certbot._internal import observability
 from certbot._internal import error_handler
 from certbot._internal import san
 from certbot._internal import storage
@@ -73,7 +74,23 @@ def create_acme_client(config: configuration.NamespaceConfig,
     if server_override:
         server = server_override
     directory = acme_client.ClientV2.get_directory(server, net)
-    return acme_client.ClientV2(directory, net)
+    client = acme_client.ClientV2(directory, net)
+    _attach_cancellable_polling(client, config)
+    return client
+
+
+def _attach_cancellable_polling(client: acme_client.ClientV2,
+                                config: configuration.NamespaceConfig) -> None:
+    """Make ACME Retry-After waits responsive to a configured cancellation token."""
+    runtime = observability.observability_from_config(config)
+    if runtime.enabled and runtime.config.cancel_token is not None:
+        set_poll_sleep = getattr(client, "set_poll_sleep", None)
+        if set_poll_sleep is None:
+            logger.warning(
+                "The installed ACME library does not support cancellation-aware polling; "
+                "Certbot will still cancel between ACME requests.")
+            return
+        set_poll_sleep(lambda seconds: observability.wait_or_cancel(seconds, config))
 
 
 def determine_user_agent(config: configuration.NamespaceConfig) -> str:
@@ -291,11 +308,14 @@ class Client:
         self.account = account_
         self.auth = auth
         self.installer = installer
+        self.observability = observability.observability_from_config(config)
 
         # Initialize ACME if account is provided
         if acme is None and self.account is not None:
             acme = create_acme_client(config, self.account.key, self.account.regr)
         self.acme = acme
+        if self.acme is not None:
+            _attach_cancellable_polling(self.acme, config)
 
         self.auth_handler: Optional[auth_handler.AuthHandler]
         if auth is not None:
@@ -365,6 +385,20 @@ class Client:
         :rtype: tuple
 
         """
+        if not self.observability.enabled:
+            return self._obtain_certificate(sans, old_keypath, None)
+
+        with self.observability.attempt(
+                "obtain-certificate",
+                total=4,
+                unit="phases",
+                context={"identifier_count": len(sans)}) as task:
+            return self._obtain_certificate(sans, old_keypath, task)
+
+    def _obtain_certificate(self, sans: list[san.SAN], old_keypath: Optional[str],
+                            task: Optional[observability.TaskObservation]
+                            ) -> tuple[bytes, bytes, util.Key, util.CSR]:
+        """Obtain a certificate, reporting progress through ``task`` if enabled."""
         # We need to determine the key path, key PEM data, CSR path,
         # and CSR PEM data.  For a dry run, the paths are None because
         # they aren't permanently saved to disk.  For a lineage with
@@ -432,6 +466,9 @@ class Client:
                 key, domains_str, None, self.config.must_staple, self.config.strict_permissions,
                 ipaddrs=ip_addresses_typed)
 
+        if task is not None:
+            task.progress(1, stage="csr-ready")
+
         try:
             orderr = self._get_order_and_authorizations(csr.data, self.config.allow_subset_of_names)
         except messages.Error as error:
@@ -441,8 +478,12 @@ class Client:
             if self.config.allow_subset_of_names:
                 successful_sans = self._successful_sans_from_error(error, sans)
                 if successful_sans != sans and len(successful_sans) != 0:
+                    if task is not None:
+                        task.supersede()
                     return self._retry_obtain_certificate(sans, successful_sans, old_keypath)
             raise
+        if task is not None:
+            task.progress(3, stage="authorizations-complete")
         authzr = orderr.authorizations
         auth_ident_values = {a.body.identifier.value for a in authzr}
         successful_sans = [s for s in sans if str(s) in auth_ident_values]
@@ -453,10 +494,19 @@ class Client:
         # sans contains a wildcard because the ACME spec forbids identifiers
         # in authzs from containing a wildcard character.
         if self.config.allow_subset_of_names and successful_sans != sans:
+            if task is not None:
+                task.progress(
+                    3,
+                    stage="retrying-with-reduced-identifiers",
+                    message=f"{len(sans) - len(successful_sans)} identifier(s) rejected",
+                )
+                task.supersede()
             return self._retry_obtain_certificate(sans, successful_sans, old_keypath)
         else:
             try:
                 cert, chain = self.obtain_certificate_from_csr(csr, orderr)
+                if task is not None:
+                    task.progress(4, stage="certificate-issued")
                 return cert, chain, key, csr
             except messages.Error as error:
                 # Some sans may be rejected during the very late stage of
@@ -465,6 +515,15 @@ class Client:
                 if self.config.allow_subset_of_names:
                     successful_sans = self._successful_sans_from_error(error, sans)
                     if successful_sans != sans and len(successful_sans) != 0:
+                        if task is not None:
+                            task.progress(
+                                3,
+                                stage="retrying-with-reduced-identifiers",
+                                message=(
+                                    f"{len(sans) - len(successful_sans)} identifier(s) rejected"
+                                ),
+                            )
+                            task.supersede()
                         return self._retry_obtain_certificate(
                             sans, successful_sans, old_keypath)
                 raise

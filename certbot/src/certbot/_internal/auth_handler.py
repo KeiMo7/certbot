@@ -18,6 +18,7 @@ from certbot import configuration
 from certbot import errors
 from certbot import interfaces
 from certbot._internal import error_handler
+from certbot._internal import observability
 from certbot._internal.account import Account
 from certbot.display import util as display_util
 from certbot.plugins import common as plugin_common
@@ -66,13 +67,37 @@ class AuthHandler:
 
         :raises .AuthorizationError: If unable to retrieve all authorizations
         """
+        runtime = observability.observability_from_config(config)
+        if not runtime.enabled:
+            return self._handle_authorizations(
+                orderr, config, best_effort, max_retries, max_time_mins, None)
+
+        with runtime.attempt(
+                "authorizations",
+                total=len(orderr.authorizations),
+                unit="authorizations",
+                context={"authorization_count": len(orderr.authorizations)}) as task:
+            return self._handle_authorizations(
+                orderr, config, best_effort, max_retries, max_time_mins, task)
+
+    def _handle_authorizations(self, orderr: messages.OrderResource,
+                               config: configuration.NamespaceConfig, best_effort: bool,
+                               max_retries: int, max_time_mins: float,
+                               task: Optional[observability.TaskObservation]
+                               ) -> list[messages.AuthorizationResource]:
+        """Handle authorizations, optionally recording progress."""
         authzrs = orderr.authorizations[:]
         if not authzrs:
             raise errors.AuthorizationError('No authorization to handle.')
 
+        if task is not None:
+            task.progress(0, stage="selecting-challenges", force=True)
+
         # Retrieve challenges that need to be performed to validate authorizations.
         achalls = self._choose_challenges(authzrs)
         if not achalls:
+            if task is not None:
+                task.progress(len(authzrs), stage="complete", total=len(authzrs), force=True)
             return authzrs
 
         # Starting now, challenges will be cleaned at the end no matter what.
@@ -95,11 +120,24 @@ class AuthHandler:
 
             # Inform the ACME CA server that challenges are available for validation.
             for achall, resp in zip(achalls, resps):
+                observability.check_cancelled(config)
                 self.acme.answer_challenge(achall.challb, resp)
+                if task is not None:
+                    task.advance(stage="submitting-challenges")
 
             # Wait for authorizations to be checked.
             logger.info('Waiting for verification...')
-            self._poll_authorizations(authzrs, max_retries, max_time_mins, best_effort)
+            progress_base = len(achalls)
+            if task is not None:
+                task.progress(
+                    progress_base,
+                    stage="waiting-for-verification",
+                    total=progress_base + len(authzrs),
+                    force=True,
+                )
+            self._poll_authorizations(
+                authzrs, max_retries, max_time_mins, best_effort, config,
+                task, progress_base)
 
             # Keep validated authorizations only. If there is none, no certificate can be issued.
             authzrs_validated = [authzr for authzr in authzrs
@@ -136,7 +174,10 @@ class AuthHandler:
         return (deactivated, failed)
 
     def _poll_authorizations(self, authzrs: list[messages.AuthorizationResource], max_retries: int,
-                             deadline_minutes: float, best_effort: bool) -> None:
+                             deadline_minutes: float, best_effort: bool,
+                             config: Optional[configuration.NamespaceConfig] = None,
+                             task: Optional[observability.TaskObservation] = None,
+                             progress_base: int = 0) -> None:
         """
         Poll the ACME CA server, to wait for confirmation that authorizations have their challenges
         all verified. The poll may occur several times, until all authorizations are checked
@@ -150,12 +191,19 @@ class AuthHandler:
         # Give an initial second to the ACME CA server to check the authorizations
         sleep_seconds: float = 1
         for _ in range(max_retries):
+            observability.check_cancelled(config)
             # Wait for appropriate time (from Retry-After, initial wait, or no wait)
             if sleep_seconds > 0:
-                time.sleep(sleep_seconds)
+                runtime = observability.observability_from_config(config)
+                if runtime.config.cancel_token is None:
+                    time.sleep(sleep_seconds)
+                else:
+                    observability.wait_or_cancel(sleep_seconds, config)
             # Poll all updated authorizations.
+            observability.check_cancelled(config)
             authzrs_to_check = {index: self.acme.poll(authzr) for index, (authzr, _)
                                 in authzrs_to_check.items()}
+            observability.check_cancelled(config)
             # Update the original list of authzr with the updated authzrs from server.
             for index, (authzr, _) in authzrs_to_check.items():
                 authzrs[index] = authzr
@@ -175,6 +223,13 @@ class AuthHandler:
             authzrs_to_check = {index: (authzr, resp) for index, (authzr, resp)
                                 in authzrs_to_check.items()
                                 if authzr.body.status == messages.STATUS_PENDING}
+            if task is not None:
+                completed = len(authzrs) - len(authzrs_to_check)
+                task.progress(
+                    progress_base + completed,
+                    stage="waiting-for-verification",
+                    total=progress_base + len(authzrs),
+                )
             if not authzrs_to_check or datetime.datetime.now() > deadline:
                 # Polling process is finished, we can leave the loop
                 break
@@ -260,7 +315,8 @@ class AuthHandler:
 
         """
         logger.info("Cleaning up challenges")
-        self.auth.cleanup(achalls)
+        with observability.suspend_cancellation():
+            self.auth.cleanup(achalls)
 
     def _challenge_factory(self, authzr: messages.AuthorizationResource,
                            path: Sequence[int]) -> list[achallenges.AnnotatedChallenge]:

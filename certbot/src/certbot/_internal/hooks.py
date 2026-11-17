@@ -6,6 +6,7 @@ from typing import Optional
 from certbot import configuration
 from certbot import errors
 from certbot import util
+from certbot._internal import observability
 from certbot._internal import san
 from certbot.compat import filesystem
 from certbot.compat import misc
@@ -267,8 +268,28 @@ def _run_hook(cmd_name: str, shell_cmd: str, extra_env: Optional[dict[str, str]]
     :returns: stderr if there was any"""
     env = util.env_no_snap_for_external_calls()
     env.update(extra_env or {})
-    returncode, err, out = misc.execute_command_status(
-        cmd_name, shell_cmd, env=env)
+    observation = observability.active_observation()
+    if observation is not None and observation.enabled:
+        logger.info("Starting %s", cmd_name)
+    try:
+        returncode, err, out = misc.execute_command_status(
+            cmd_name, shell_cmd, env=env)
+    except errors.TaskCancelled:
+        if observation is not None and observation.enabled:
+            logger.info("Cancelled %s", cmd_name)
+        raise
+    except Exception:
+        if observation is not None and observation.enabled:
+            logger.error("Failed %s", cmd_name, exc_info=True)
+        raise
+    if observation is not None and observation.enabled:
+        logger.info("Finished %s with exit code %s", cmd_name, returncode)
+        if returncode != 0:
+            observation.error(
+                errors.SubprocessError(f"{cmd_name} exited with code {returncode}"),
+                category=observability.ErrorCategory.PROCESS,
+                context={"hook": cmd_name, "exit_code": returncode},
+            )
     display_ops.report_executed_command(f"Hook '{cmd_name}'", returncode, out, err)
     return err
 

@@ -153,16 +153,26 @@ def execute_command_status(cmd_name: str, shell_cmd: str,
     """
     logger.info("Running %s command: %s", cmd_name, shell_cmd)
 
-    if POSIX_MODE:
-        proc = subprocess.run(shell_cmd, shell=True, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, universal_newlines=True,
-                              check=False, env=env)
-    else:
-        line = ['powershell.exe', '-Command', shell_cmd]
-        proc = subprocess.run(line, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              universal_newlines=True, check=False, env=env)
+    # Import lazily to keep the existing subprocess.run path completely
+    # unchanged when observability is disabled.
+    from certbot._internal import observability
+    cancel_token = observability.active_cancel_token()
+    if cancel_token is None:
+        if POSIX_MODE:
+            proc = subprocess.run(shell_cmd, shell=True, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, universal_newlines=True,
+                                  check=False, env=env)
+        else:
+            line = ['powershell.exe', '-Command', shell_cmd]
+            proc = subprocess.run(line, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  universal_newlines=True, check=False, env=env)
 
-    # universal_newlines causes stdout and stderr to be str objects instead of
-    # bytes in Python 3
-    out, err = proc.stdout, proc.stderr
-    return proc.returncode, err, out
+        # universal_newlines causes stdout and stderr to be str objects instead of
+        # bytes in Python 3
+        out, err = proc.stdout, proc.stderr
+        return proc.returncode, err, out
+
+    if POSIX_MODE:
+        return observability.run_process(shell_cmd, shell=True, env=env)
+    return observability.run_process(
+        ['powershell.exe', '-Command', shell_cmd], shell=False, env=env)
